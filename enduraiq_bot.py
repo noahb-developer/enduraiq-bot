@@ -1,353 +1,393 @@
 #!/usr/bin/env python3
-"""EnduraIQ Coach — Telegram Bot MVP"""
-
-import asyncio
+"""EnduraIQ Coach — Telegram Bot v2: Multi-user with CSV upload"""
+ 
+import os
+import csv
+import io
+import re
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
-TOKEN = "8744873375:AAFg9AGD4FK_ulE4zR3lb6O4cnK6P2Vl5-8"
-
-# ── Athlete Profile ──────────────────────────────────────
-RUN_LTHR = 182
-BIKE_LTHR = 168
-MAX_HR = 207
-
-# ── Training Data (from Alex's real Garmin exports) ──────
-WORKOUTS = {
-    "long_run": {
-        "name": "Long Run",
-        "distance": "13.94 km",
-        "time": "1:30:01",
-        "avg_hr": 136,
-        "max_hr": 160,
-        "laps_hr": [115, 127, 133, 131, 133, 134, 137, 137, 138, 139, 140, 142, 154, 157],
-        "laps_pace": ["8:39", "7:24", "6:43", "6:45", "6:29", "6:15", "6:11", "6:10", "6:14", "6:13", "6:16", "6:23", "5:22", "5:16"],
-    },
-    "bike": {
-        "name": "Bike Ride",
-        "distance": "62.61 km",
-        "time": "2:15:12",
-        "avg_hr": 146,
-        "max_hr": 169,
-        "avg_speed": 27.8,
-        "laps_hr": [142, 148, 153, 153, 145, 141, 147, 146, 146, 145, 142, 142, 147],
-        "laps_speed": [27.7, 27.0, 28.3, 27.9, 27.9, 28.1, 29.6, 28.9, 27.3, 28.0, 26.9, 25.9, 28.3],
-    },
-    "swim": {
-        "name": "Swim",
-        "distance": "1,775m",
-        "time": "48:38",
-        "avg_hr": 134,
-        "max_hr": 167,
-        "sets_hr": [129, 146, 153, 150, 153, 158],
-        "sets_pace": ["1:59", "2:05", "2:06", "2:14", "2:08", "2:08"],
-        "sets_swolf": [44, 46, 47, 49, 48, 48],
-    },
-    "tempo_run": {
-        "name": "Tempo Run",
-        "distance": "5.28 km",
-        "time": "27:58",
-        "avg_hr": 157,
-        "max_hr": 165,
-        "laps_hr": [143, 159, 159, 159, 162],
-        "laps_pace": ["5:27", "5:17", "5:13", "5:12", "5:18"],
-    },
-}
-
-
-def analyze_long_run():
-    d = WORKOUTS["long_run"]
-    steady = d["laps_hr"][2:12]
-    first = sum(steady[:5]) / 5
-    second = sum(steady[5:]) / 5
-    drift = ((second - first) / first) * 100
-
-    z2_ceil = int(RUN_LTHR * 0.90)
-    below_z2 = sum(1 for h in d["laps_hr"] if h < int(RUN_LTHR * 0.81))
-    in_z2 = sum(1 for h in d["laps_hr"] if int(RUN_LTHR * 0.81) <= h < z2_ceil)
-    above_z2 = sum(1 for h in d["laps_hr"] if h >= z2_ceil)
-
-    msg = f"""🏃 *LONG RUN ANALYSIS*
-{d['distance']} · {d['time']} · Avg HR {d['avg_hr']}
-
-*Zone Distribution:*
-Zone 1: {below_z2}/14 laps ({below_z2*100//14}%)
-Zone 2: {in_z2}/14 laps ({in_z2*100//14}%)
-Zone 3+: {above_z2}/14 laps ({above_z2*100//14}%)
-
-*Cardiac Drift (km 3-12):*
-First half HR: {first:.0f} bpm
-Second half HR: {second:.0f} bpm
-Drift: {drift:.1f}%
-"""
-    if drift < 5:
-        msg += "✅ Good — your aerobic system is holding up well\n"
-    elif drift < 8:
-        msg += "⚠️ Moderate — more Zone 2 volume needed\n"
+ 
+TOKEN = os.environ.get("BOT_TOKEN", "8744873375:AAFg9AGD4FK_ulE4zR3lb6O4cnK6P2Vl5-8")
+ 
+# Store user data in memory
+user_data = {}
+ 
+# ── Zone Calculations ────────────────────────────────────
+def get_zones(lthr):
+    return {
+        'Zone 1': (0, int(lthr * 0.81)),
+        'Zone 2': (int(lthr * 0.81), int(lthr * 0.90)),
+        'Zone 3': (int(lthr * 0.90), int(lthr * 0.94)),
+        'Zone 4': (int(lthr * 0.94), int(lthr * 1.0)),
+        'Zone 5': (int(lthr * 1.0), 999),
+    }
+ 
+def classify_zone(hr, zones):
+    for name, (lo, hi) in zones.items():
+        if lo <= hr < hi:
+            return name
+    return 'Zone 5'
+ 
+def safe_int(val):
+    try:
+        return int(val.strip().strip('"').replace(',', ''))
+    except:
+        return 0
+ 
+def safe_float(val):
+    try:
+        return float(val.strip().strip('"').replace(',', ''))
+    except:
+        return 0.0
+ 
+# ── CSV Parsing ──────────────────────────────────────────
+def detect_activity_type(text):
+    first_line = text.split('\n')[0].lower()
+    if 'swim stroke' in first_line or 'swolf' in first_line or 'lengths' in first_line:
+        return 'swim'
+    elif 'avg speed' in first_line and 'avg pace' not in first_line:
+        return 'bike'
     else:
-        msg += "🔴 High drift — aerobic base needs work\n"
-
-    msg += f"""
-*Pacing:*
-Km 1-2: Warmup (8:39 → 7:24)
-Km 3-12: Steady (6:43 → 6:23)
-Km 13-14: Surge (5:22 → 5:16)
-✅ You had energy reserves at the end — great for Ironman
-
-*Coach's Note:*
-This was a well-executed long run. Your drift of {drift:.1f}% shows your aerobic base is developing. Keep these runs in Zone 1-2 and resist the urge to push pace. The fitness comes from time on feet, not speed."""
-    return msg
-
-
-def analyze_bike():
-    d = WORKOUTS["bike"]
-    first6 = d["laps_hr"][:6]
-    second6 = d["laps_hr"][6:12]
-    f_hr = sum(first6) / len(first6)
-    s_hr = sum(second6) / len(second6)
-    drift = ((s_hr - f_hr) / f_hr) * 100
-
-    z2_lo = int(BIKE_LTHR * 0.81)
-    z2_hi = int(BIKE_LTHR * 0.90)
-    z3_hi = int(BIKE_LTHR * 0.94)
-    above = [i+1 for i, h in enumerate(d["laps_hr"]) if h >= z2_hi]
-
-    msg = f"""🚴 *BIKE RIDE ANALYSIS*
-{d['distance']} · {d['time']} · Avg HR {d['avg_hr']} · {d['avg_speed']} km/h
-
-*Cardiac Drift:*
-First 30km HR: {f_hr:.0f} bpm
-Last 30km HR: {s_hr:.0f} bpm
-Drift: {drift:+.1f}%
-"""
-    if drift < 0:
-        msg += "✅ HR decreased — you settled into a rhythm\n"
+        return 'run'
+ 
+def parse_run_csv(text):
+    reader = csv.reader(io.StringIO(text.replace('\r\n', '\n')))
+    header = next(reader)
+    hr_col = pace_col = dist_col = time_col = None
+    for i, h in enumerate(header):
+        h_clean = h.strip().strip('"').lower().replace('\n', ' ')
+        if 'avg hr' in h_clean: hr_col = i
+        if 'avg pace' in h_clean and pace_col is None: pace_col = i
+        if 'distance' in h_clean and dist_col is None: dist_col = i
+        if 'cumulative time' in h_clean: time_col = i
+    if hr_col is None: return None
+    laps = []
+    summary = None
+    for row in reader:
+        if not row: continue
+        label = row[0].strip().strip('"')
+        if label.lower() == 'summary':
+            summary = {'avg_hr': safe_int(row[hr_col]), 'time': row[time_col].strip().strip('"') if time_col else '', 'distance': row[dist_col].strip().strip('"') if dist_col else ''}
+            continue
+        hr = safe_int(row[hr_col])
+        if hr > 0:
+            lap = {'lap': label, 'avg_hr': hr}
+            if pace_col and pace_col < len(row): lap['pace'] = row[pace_col].strip().strip('"')
+            laps.append(lap)
+    return {'type': 'run', 'laps': laps, 'summary': summary}
+ 
+def parse_bike_csv(text):
+    reader = csv.reader(io.StringIO(text.replace('\r\n', '\n')))
+    header = next(reader)
+    hr_col = speed_col = dist_col = time_col = None
+    for i, h in enumerate(header):
+        h_clean = h.strip().strip('"').lower().replace('\n', ' ')
+        if 'avg hr' in h_clean: hr_col = i
+        if 'avg speed' in h_clean and speed_col is None: speed_col = i
+        if 'distance' in h_clean and dist_col is None: dist_col = i
+        if 'cumulative time' in h_clean: time_col = i
+    if hr_col is None: return None
+    laps = []
+    summary = None
+    for row in reader:
+        if not row: continue
+        label = row[0].strip().strip('"')
+        if label.lower() == 'summary':
+            summary = {'avg_hr': safe_int(row[hr_col]), 'time': row[time_col].strip().strip('"') if time_col else '', 'distance': row[dist_col].strip().strip('"') if dist_col else '', 'avg_speed': safe_float(row[speed_col]) if speed_col else 0}
+            continue
+        hr = safe_int(row[hr_col])
+        if hr > 0:
+            lap = {'lap': label, 'avg_hr': hr}
+            if speed_col and speed_col < len(row): lap['speed'] = safe_float(row[speed_col])
+            laps.append(lap)
+    return {'type': 'bike', 'laps': laps, 'summary': summary}
+ 
+def parse_swim_csv(text):
+    reader = csv.reader(io.StringIO(text.replace('\r\n', '\n')))
+    header = next(reader)
+    hr_col = pace_col = swolf_col = dist_col = stroke_col = None
+    for i, h in enumerate(header):
+        h_clean = h.strip().strip('"').lower().replace('\n', ' ')
+        if 'avg hr' in h_clean: hr_col = i
+        if 'avg pace' in h_clean: pace_col = i
+        if 'swolf' in h_clean: swolf_col = i
+        if 'distance' in h_clean: dist_col = i
+        if 'swim stroke' in h_clean: stroke_col = i
+    if hr_col is None: return None
+    sets = []
+    summary = None
+    for row in reader:
+        if not row: continue
+        label = row[1].strip().strip('"') if len(row) > 1 else ''
+        if label.lower() == 'summary':
+            summary = {'avg_hr': safe_int(row[hr_col]) if hr_col else 0}
+            continue
+        if stroke_col and stroke_col < len(row):
+            stroke = row[stroke_col].strip().strip('"').lower()
+            if stroke == 'rest' or stroke == '--': continue
+        if '.' in label: continue
+        hr = safe_int(row[hr_col]) if hr_col and hr_col < len(row) else 0
+        if hr > 0 and label:
+            s = {'set': label, 'avg_hr': hr}
+            if pace_col and pace_col < len(row): s['pace'] = row[pace_col].strip().strip('"')
+            if swolf_col and swolf_col < len(row): s['swolf'] = safe_int(row[swolf_col])
+            if dist_col and dist_col < len(row): s['distance'] = row[dist_col].strip().strip('"')
+            sets.append(s)
+    return {'type': 'swim', 'sets': sets, 'summary': summary}
+ 
+# ── Analysis Functions ───────────────────────────────────
+def analyze_run(data, lthr):
+    laps = data['laps']
+    summary = data['summary']
+    zones = get_zones(lthr)
+    if len(laps) < 3: return "Not enough laps to analyze. Need at least 3 km."
+    zone_counts = {'Zone 1': 0, 'Zone 2': 0, 'Zone 3': 0, 'Zone 4': 0, 'Zone 5': 0}
+    for lap in laps:
+        zone_counts[classify_zone(lap['avg_hr'], zones)] += 1
+    total = len(laps)
+    analysis_laps = laps[1:-2] if len(laps) > 5 else laps[1:]
+    if len(analysis_laps) >= 4:
+        mid = len(analysis_laps) // 2
+        first_hr = sum(l['avg_hr'] for l in analysis_laps[:mid]) / mid
+        second_hr = sum(l['avg_hr'] for l in analysis_laps[mid:]) / len(analysis_laps[mid:])
     else:
-        msg += f"⚠️ HR climbed {drift:.1f}% — watch your pacing early\n"
-
-    if above:
-        msg += f"""
-⚠️ *Intensity Flag:*
-Laps {above} hit Zone 3+ (HR ≥{z2_hi})
-Your Zone 2 ceiling on bike = {z2_hi} bpm
-If this was an easy ride, those laps were too hard
-"""
-
-    msg += f"""
-*Ironman Projection:*
-At this speed (27.8 km/h) with HR 146: ~6h 28min
-But HR 146 is too high for a full Ironman bike
-At true Zone 2 pace (~25 km/h): ~7h 12min
-
-*Coach's Note:*
-Your bike fitness is building. The key issue is intensity — you're riding at the top of Zone 2 / low Zone 3. For Ironman, you need to ride 30-60km at HR {z2_lo}-{z2_hi} comfortably. Slow down now = faster on race day."""
+        first_hr, second_hr = laps[0]['avg_hr'], laps[-1]['avg_hr']
+    drift = ((second_hr - first_hr) / first_hr) * 100
+    avg_hr = summary['avg_hr'] if summary else sum(l['avg_hr'] for l in laps) // len(laps)
+    pct_lthr = (avg_hr / lthr) * 100
+    if pct_lthr < 81: run_type = "Easy / Recovery Run"
+    elif pct_lthr < 90: run_type = "Aerobic / Zone 2 Run"
+    elif pct_lthr < 94: run_type = "Tempo Run"
+    elif pct_lthr < 100: run_type = "Threshold Run"
+    else: run_type = "VO2max / Interval Session"
+    dist = summary['distance'] if summary else str(len(laps))
+    time = summary['time'] if summary else "N/A"
+    msg = f"🏃 *RUN ANALYSIS*\n{dist} km · {time} · Avg HR {avg_hr}\n\n*Type:* {run_type}\nAvg HR = {pct_lthr:.0f}% of LTHR ({lthr})\n\n*Zone Distribution:*"
+    for z, count in zone_counts.items():
+        pct = count * 100 // total if total > 0 else 0
+        bar = "█" * (pct // 5)
+        msg += f"\n{z}: {count}/{total} ({pct}%) {bar}"
+    msg += f"\n\n*Cardiac Drift:*\nFirst half: {first_hr:.0f} bpm\nSecond half: {second_hr:.0f} bpm\nDrift: {drift:.1f}%"
+    if drift < 3: msg += "\n✅ Excellent aerobic base"
+    elif drift < 5: msg += "\n✅ Good — solid aerobic system"
+    elif drift < 8: msg += "\n⚠️ Moderate — more Zone 2 volume needed"
+    else: msg += "\n🔴 High — aerobic base needs work"
+    z2_ceil = zones['Zone 2'][1]
+    if pct_lthr < 90:
+        over = sum(1 for l in laps if l['avg_hr'] > z2_ceil)
+        if over > 0: msg += f"\n\n*Coach:* ⚠️ {over} laps exceeded Zone 2 ceiling ({z2_ceil} bpm). Slow down on easy days."
+        else: msg += f"\n\n*Coach:* Well-executed aerobic run. You stayed under Zone 2 ceiling ({z2_ceil}). This builds your engine."
+    elif pct_lthr < 94: msg += "\n\n*Coach:* Solid tempo. Keep to once per week max."
+    elif pct_lthr < 100: msg += "\n\n*Coach:* Hard session. Next 2 days should be easy/rest."
+    else: msg += "\n\n*Coach:* High intensity. Make sure you recover properly."
     return msg
-
-
-def analyze_swim():
-    d = WORKOUTS["swim"]
-    hr_drift = ((d["sets_hr"][-1] - d["sets_hr"][0]) / d["sets_hr"][0]) * 100
-    swolf_change = d["sets_swolf"][-1] - d["sets_swolf"][0]
-
-    msg = f"""🏊 *SWIM ANALYSIS*
-{d['distance']} · {d['time']} · Avg HR {d['avg_hr']}
-
-*200m Repeats (Sets 4-9):*
-Set 4: {d['sets_pace'][0]}/100m · HR {d['sets_hr'][0]} · SWOLF {d['sets_swolf'][0]}
-Set 5: {d['sets_pace'][1]}/100m · HR {d['sets_hr'][1]} · SWOLF {d['sets_swolf'][1]}
-Set 6: {d['sets_pace'][2]}/100m · HR {d['sets_hr'][2]} · SWOLF {d['sets_swolf'][2]}
-Set 7: {d['sets_pace'][3]}/100m · HR {d['sets_hr'][3]} · SWOLF {d['sets_swolf'][3]}
-Set 8: {d['sets_pace'][4]}/100m · HR {d['sets_hr'][4]} · SWOLF {d['sets_swolf'][4]}
-Set 9: {d['sets_pace'][5]}/100m · HR {d['sets_hr'][5]} · SWOLF {d['sets_swolf'][5]}
-
-*Cardiac Drift:*
-HR rose from {d['sets_hr'][0]} → {d['sets_hr'][-1]} bpm ({hr_drift:.0f}%)
-🔴 Significant — HR climbed 29 bpm while pace slowed
-
-*Efficiency:*
-SWOLF went from {d['sets_swolf'][0]} → {d['sets_swolf'][-1]} (+{swolf_change})
-Technique breaks down with fatigue
-
-*CSS Check:*
-Your benchmark: 1:56/100m
-First set: {d['sets_pace'][0]} (close to CSS)
-Last set: {d['sets_pace'][-1]} (12 sec slower)
-
-*Coach's Note:*
-Your swim fitness is the biggest area for improvement. The 29 bpm HR jump across 6x200m tells me your aerobic swim base needs more volume. Focus on longer continuous swims (800-1500m) at 2:05-2:10 pace. Don't chase speed — chase the ability to hold pace without HR climbing."""
+ 
+def analyze_bike_data(data, lthr):
+    laps = data['laps']
+    summary = data['summary']
+    zones = get_zones(lthr)
+    if len(laps) < 2: return "Not enough laps to analyze."
+    zone_counts = {'Zone 1': 0, 'Zone 2': 0, 'Zone 3': 0, 'Zone 4': 0, 'Zone 5': 0}
+    for lap in laps:
+        zone_counts[classify_zone(lap['avg_hr'], zones)] += 1
+    total = len(laps)
+    mid = len(laps) // 2
+    first_hr = sum(l['avg_hr'] for l in laps[:mid]) / mid
+    second_hr = sum(l['avg_hr'] for l in laps[mid:]) / len(laps[mid:])
+    drift = ((second_hr - first_hr) / first_hr) * 100
+    avg_hr = summary['avg_hr'] if summary else sum(l['avg_hr'] for l in laps) // len(laps)
+    avg_speed = summary.get('avg_speed', 0) if summary else 0
+    dist = summary['distance'] if summary else 'N/A'
+    time = summary['time'] if summary else 'N/A'
+    msg = f"🚴 *BIKE ANALYSIS*\n{dist} km · {time} · Avg HR {avg_hr}"
+    if avg_speed: msg += f" · {avg_speed:.1f} km/h"
+    msg += "\n\n*Zone Distribution:*"
+    for z, count in zone_counts.items():
+        pct = count * 100 // total if total > 0 else 0
+        bar = "█" * (pct // 5)
+        msg += f"\n{z}: {count}/{total} ({pct}%) {bar}"
+    msg += f"\n\n*Cardiac Drift:*\nFirst half: {first_hr:.0f} bpm\nSecond half: {second_hr:.0f} bpm\nDrift: {drift:+.1f}%"
+    if drift < 0: msg += "\n✅ HR decreased — good settling"
+    elif drift < 5: msg += "\n✅ Acceptable drift"
+    else: msg += "\n⚠️ Significant drift — pacing too hard early"
+    z3_floor = zones['Zone 3'][0]
+    z2_ceil = zones['Zone 2'][1]
+    high = sum(1 for l in laps if l['avg_hr'] >= z3_floor)
+    if high > 0: msg += f"\n\n⚠️ *Intensity Flag:* {high} laps hit Zone 3+ (HR ≥{z3_floor}). Zone 2 ceiling = {z2_ceil}"
+    if avg_speed > 0:
+        t = 180 / avg_speed
+        msg += f"\n\n*Ironman Projection:* At {avg_speed:.1f} km/h: ~{int(t)}h {int((t%1)*60)}min for 180km"
+    msg += f"\n\n*Coach:* Ironman bike = Zone 2 only (HR {zones['Zone 2'][0]}-{z2_ceil}). Riding harder costs you the run."
     return msg
-
-
-def analyze_tempo():
-    d = WORKOUTS["tempo_run"]
-    pct = (d["avg_hr"] / RUN_LTHR) * 100
-    hr_change = d["laps_hr"][-1] - d["laps_hr"][1]
-
-    msg = f"""⚡ *TEMPO RUN ANALYSIS*
-{d['distance']} · {d['time']} · Avg HR {d['avg_hr']}
-
-*Intensity:*
-Avg HR {d['avg_hr']} = {pct:.0f}% of LTHR ({RUN_LTHR})
-✅ Correctly in Zone 3 (Tempo)
-
-*Pacing:*
-Km 1: {d['laps_pace'][0]} (warmup into effort)
-Km 2: {d['laps_pace'][1]} @ {d['laps_hr'][1]} bpm
-Km 3: {d['laps_pace'][2]} @ {d['laps_hr'][2]} bpm
-Km 4: {d['laps_pace'][3]} @ {d['laps_hr'][3]} bpm
-Km 5: {d['laps_pace'][4]} @ {d['laps_hr'][4]} bpm
-✅ Locked in at ~5:15/km — excellent pacing
-
-*Efficiency:*
-Same pace, HR rose only {hr_change} bpm over 4 km
-✅ Minimal drift under load — good sign
-
-*Coach's Note:*
-This is a textbook tempo execution. You held pace, your HR stayed controlled, and the slight fade at km 5 is totally normal. These sessions build your lactate threshold — keep them to once per week max."""
+ 
+def analyze_swim_data(data):
+    sets = [s for s in data['sets'] if s['avg_hr'] > 50]
+    if len(sets) < 2: return "Not enough swim sets with HR data."
+    msg = "🏊 *SWIM ANALYSIS*\n\n*Set Breakdown:*\n"
+    for s in sets:
+        line = f"Set {s['set']}: HR {s['avg_hr']}"
+        if 'pace' in s and s['pace'] and s['pace'] != '--': line += f" · {s['pace']}/100m"
+        if 'swolf' in s and s['swolf']: line += f" · SWOLF {s['swolf']}"
+        msg += line + "\n"
+    drift = ((sets[-1]['avg_hr'] - sets[0]['avg_hr']) / sets[0]['avg_hr']) * 100
+    msg += f"\n*Cardiac Drift:* {sets[0]['avg_hr']} → {sets[-1]['avg_hr']} ({drift:.1f}%)"
+    if drift > 15: msg += "\n🔴 High — aerobic swim base needs volume"
+    elif drift > 8: msg += "\n⚠️ Moderate — build longer continuous swims"
+    else: msg += "\n✅ Controlled drift"
+    swolf_sets = [s for s in sets if 'swolf' in s and s['swolf'] > 0]
+    if len(swolf_sets) >= 2:
+        sc = swolf_sets[-1]['swolf'] - swolf_sets[0]['swolf']
+        msg += f"\n\n*Efficiency:* SWOLF {swolf_sets[0]['swolf']} → {swolf_sets[-1]['swolf']} ({sc:+d})"
+        if sc > 3: msg += "\n⚠️ Technique breaking down — add drill work"
+    msg += "\n\n*Coach:* Build longer continuous swims (800-1500m) at easy pace. The goal is holding pace without HR climbing."
     return msg
-
-
-def get_weekly_summary():
-    msg = """📊 *ENDURAIQ — WEEKLY SUMMARY*
-
-*Athlete Profile:*
-Run LTHR: 182 bpm | Bike LTHR: 168 bpm
-Target: IRONMAN Jacksonville, May 2027
-Goal: Sub-10 hours
-
-*Current Fitness:*
-🏊 Swim: ~2:05/100m realistic pace
-🚴 Bike: 27.8 km/h but at Zone 3 HR
-🏃 Run: 6:15-6:30/km easy | 5:15/km tempo
-
-*Ironman Projection:*
-Swim: ~1h 20min
-Bike: ~7h 12min (Zone 2 pace)
-Run: ~4h 30min (conservative off-bike)
-Total: ~13h 12min
-Gap to sub-10: ~3h 12min
-
-*Top 3 Priorities:*
-
-1️⃣ *BIKE* — You're riding too hard. Avg HR 146 is Zone 3. Ironman bike must be Zone 2 (136-151 bpm). Slow down.
-
-2️⃣ *SWIM* — More aerobic volume. Your HR jumps 29 bpm over 6x200m. Build longer continuous swims at 2:05-2:10 pace.
-
-3️⃣ *RUN* — Well executed. Cardiac drift 4.2% is solid. Keep building distance gradually.
-
-*Recovery Check:*
-⚠️ No recovery week detected in recent data. Consider dropping volume 40% this week.
-
-_This report is generated by EnduraIQ from your Garmin data._"""
-    return msg
-
-
+ 
 # ── Bot Handlers ─────────────────────────────────────────
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = """👋 *Welcome to EnduraIQ*
-
-I'm your AI endurance coach. I analyze your training data and give you real coaching — not just charts.
-
+ 
+I'm your AI endurance coach. Send me your Garmin CSV files and I'll give you real coaching — not just charts.
+ 
+*Get started in 2 steps:*
+ 
+1️⃣ Set your zones — send me:
+`run: 180 bike: 165`
+(replace with your LTHR numbers)
+Or use /defaults for estimated values
+ 
+2️⃣ Export a workout from Garmin Connect as CSV and send it here
+ 
 *Commands:*
-/longrun — Analyze your last long run
-/bike — Analyze your last bike ride
-/swim — Analyze your last swim
-/tempo — Analyze your last tempo run
-/weekly — Full weekly training summary
-/projections — Ironman race projections
-
-Just finished a workout? I'll tell you what it means and what to do next.
-
+/setup — How to set your LTHR
+/defaults — Use estimated zones
+/help — How to export from Garmin
+/about — What I analyze
+ 
 _Built by an athlete, for athletes._"""
     await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-async def longrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(analyze_long_run(), parse_mode="Markdown")
-
-async def bike(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(analyze_bike(), parse_mode="Markdown")
-
-async def swim(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(analyze_swim(), parse_mode="Markdown")
-
-async def tempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(analyze_tempo(), parse_mode="Markdown")
-
-async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(get_weekly_summary(), parse_mode="Markdown")
-
-async def projections(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = """🏁 *IRONMAN PROJECTIONS*
-_Based on current training data_
-
-*Current estimated splits:*
-🏊 Swim 3.8km: *1h 20min* (2:08/100m)
-🚴 Bike 180km: *7h 12min* (25 km/h @ Z2)
-🏃 Run 42.2km: *4h 30min* (6:25/km off-bike)
-🔄 Transitions: *10 min*
-━━━━━━━━━━━━
-📍 *Total: ~13h 12min*
-
-*Sub-10 target splits:*
-🏊 Swim: 1h 10min (1:50/100m)
-🚴 Bike: 5h 30min (32.7 km/h)
-🏃 Run: 3h 10min (4:30/km)
-🔄 Transitions: 8 min
-━━━━━━━━━━━━
-📍 *Total: 9h 58min*
-
-*Biggest gains available:*
-1. Bike — improving from 25→30 km/h saves ~1h 12min
-2. Run — improving from 6:25→5:00/km saves ~1h
-3. Swim — improving from 2:08→1:55/100m saves ~8min
-
-*Timeline: 13 months — achievable with consistent training*
-
-_Projections update automatically as your fitness improves._"""
+ 
+async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = """⚙️ *Setup Your Zones*
+ 
+Send me your LTHR like this:
+`run: 180 bike: 165`
+ 
+*Don't know your LTHR?*
+Do a 30-min all-out solo effort (run or bike). Your avg HR for the last 20 min is roughly your LTHR.
+ 
+Or use /defaults to start with estimates."""
     await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower()
-    if any(w in text for w in ["run", "running"]):
-        await update.message.reply_text("Want me to analyze your run? Use /longrun for your long run or /tempo for your tempo run.", parse_mode="Markdown")
-    elif any(w in text for w in ["bike", "cycling", "ride"]):
-        await update.message.reply_text("Use /bike to see your bike ride analysis.", parse_mode="Markdown")
-    elif any(w in text for w in ["swim", "pool"]):
-        await update.message.reply_text("Use /swim to see your swim analysis.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("Hey! Use /weekly to see your full training summary, or pick a specific workout to analyze:\n\n/longrun · /bike · /swim · /tempo", parse_mode="Markdown")
-
-
+ 
+async def defaults(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user_data[uid] = {'run_lthr': 175, 'bike_lthr': 170}
+    msg = """✅ *Defaults Set*
+Run LTHR: 175 · Bike LTHR: 170
+ 
+Now send me a Garmin CSV file!"""
+    await update.message.reply_text(msg, parse_mode="Markdown")
+ 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = """📖 *How to Export from Garmin*
+ 
+1. Go to *connect.garmin.com* on a computer
+2. Click *Activities*
+3. Click any activity
+4. Click the ⚙️ gear icon (top right)
+5. Click *Export to CSV*
+6. Send that file here
+ 
+I'll analyze zone distribution, cardiac drift, pacing, and give you coaching notes."""
+    await update.message.reply_text(msg, parse_mode="Markdown")
+ 
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = """🧠 *What EnduraIQ Analyzes*
+ 
+• *Cardiac Drift* — HR creep at same pace = aerobic fitness indicator
+• *Zone Distribution* — Are you really doing 80/20?
+• *Intensity Classification* — Easy vs tempo vs threshold vs VO2
+• *Pacing Flags* — Started too hard? Faded? I catch it
+• *Swim Efficiency* — SWOLF trends under fatigue
+• *Ironman Projections* — Estimated race splits
+ 
+Based on Friel's methodology and sports science research.
+ 
+Free during beta. $15/mo after."""
+    await update.message.reply_text(msg, parse_mode="Markdown")
+ 
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = update.message.text.strip().lower()
+    if 'run:' in text or 'bike:' in text:
+        run_lthr = 175
+        bike_lthr = 170
+        rm = re.search(r'run:\s*(\d+)', text)
+        bm = re.search(r'bike:\s*(\d+)', text)
+        if rm: run_lthr = int(rm.group(1))
+        if bm: bike_lthr = int(bm.group(1))
+        user_data[uid] = {'run_lthr': run_lthr, 'bike_lthr': bike_lthr}
+        rz = get_zones(run_lthr)
+        bz = get_zones(bike_lthr)
+        msg = f"""✅ *Profile Set*
+ 
+*Run (LTHR {run_lthr}):*
+Z1: <{rz['Zone 1'][1]} · Z2: {rz['Zone 2'][0]}-{rz['Zone 2'][1]} · Z3: {rz['Zone 3'][0]}-{rz['Zone 3'][1]} · Z4: {rz['Zone 4'][0]}-{rz['Zone 4'][1]} · Z5: >{rz['Zone 5'][0]}
+ 
+*Bike (LTHR {bike_lthr}):*
+Z1: <{bz['Zone 1'][1]} · Z2: {bz['Zone 2'][0]}-{bz['Zone 2'][1]} · Z3: {bz['Zone 3'][0]}-{bz['Zone 3'][1]} · Z4: {bz['Zone 4'][0]}-{bz['Zone 4'][1]} · Z5: >{bz['Zone 5'][0]}
+ 
+Now send me a Garmin CSV!"""
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+    await update.message.reply_text("Send me a Garmin CSV file and I'll analyze it.\n\nUse /help for export instructions.\nUse /setup to set your zones.", parse_mode="Markdown")
+ 
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    profile = user_data.get(uid, {'run_lthr': 175, 'bike_lthr': 170})
+    doc = update.message.document
+    if not doc.file_name.endswith('.csv'):
+        await update.message.reply_text("Please send a .csv file from Garmin Connect. Use /help for instructions.")
+        return
+    await update.message.reply_text("🔄 Analyzing your workout...")
+    try:
+        file = await doc.get_file()
+        file_bytes = await file.download_as_bytearray()
+        text = file_bytes.decode('utf-8', errors='ignore')
+        activity_type = detect_activity_type(text)
+        if activity_type == 'swim':
+            data = parse_swim_csv(text)
+            msg = analyze_swim_data(data) if data and len(data['sets']) >= 2 else "Couldn't parse swim data."
+        elif activity_type == 'bike':
+            data = parse_bike_csv(text)
+            msg = analyze_bike_data(data, profile['bike_lthr']) if data and len(data['laps']) >= 2 else "Couldn't parse bike data."
+        else:
+            data = parse_run_csv(text)
+            msg = analyze_run(data, profile['run_lthr']) if data and len(data['laps']) >= 2 else "Couldn't parse run data."
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {str(e)}\n\nMake sure it's a CSV from Garmin Connect.")
+ 
 async def set_commands(app):
     await app.bot.set_my_commands([
-        BotCommand("start", "Welcome & commands"),
-        BotCommand("longrun", "Analyze last long run"),
-        BotCommand("bike", "Analyze last bike ride"),
-        BotCommand("swim", "Analyze last swim"),
-        BotCommand("tempo", "Analyze last tempo run"),
-        BotCommand("weekly", "Full weekly summary"),
-        BotCommand("projections", "Ironman race projections"),
+        BotCommand("start", "Welcome & setup"),
+        BotCommand("setup", "Set your LTHR zones"),
+        BotCommand("defaults", "Use default zones"),
+        BotCommand("help", "How to export from Garmin"),
+        BotCommand("about", "What EnduraIQ analyzes"),
     ])
-
-
+ 
 def main():
     app = Application.builder().token(TOKEN).post_init(set_commands).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("longrun", longrun))
-    app.add_handler(CommandHandler("bike", bike))
-    app.add_handler(CommandHandler("swim", swim))
-    app.add_handler(CommandHandler("tempo", tempo))
-    app.add_handler(CommandHandler("weekly", weekly))
-    app.add_handler(CommandHandler("projections", projections))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    print("EnduraIQ Coach bot is running...")
+    app.add_handler(CommandHandler("setup", setup))
+    app.add_handler(CommandHandler("defaults", defaults))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("about", about))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    print("EnduraIQ Coach bot v2 is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
+ 
 if __name__ == "__main__":
     main()
