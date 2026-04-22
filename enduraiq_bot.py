@@ -1,393 +1,595 @@
 #!/usr/bin/env python3
-"""EnduraIQ Coach — Telegram Bot v2: Multi-user with CSV upload"""
- 
+"""EnduraIQ Coach v3 — Professional endurance coaching intelligence"""
+
 import os
 import csv
 import io
 import re
+from datetime import datetime
+from collections import defaultdict
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
- 
+
 TOKEN = os.environ.get("BOT_TOKEN", "8744873375:AAFg9AGD4FK_ulE4zR3lb6O4cnK6P2Vl5-8")
- 
-# Store user data in memory
-user_data = {}
- 
-# ── Zone Calculations ────────────────────────────────────
+
+user_profiles = {}
+user_workouts = defaultdict(list)
+
+def safe_int(val):
+    try: return int(str(val).strip().strip('"').replace(',', ''))
+    except: return 0
+
+def safe_float(val):
+    try: return float(str(val).strip().strip('"').replace(',', ''))
+    except: return 0.0
+
+def pace_to_min(p):
+    try:
+        parts = str(p).strip().strip('"').split(':')
+        if len(parts) == 2: return int(parts[0]) + float(parts[1])/60
+        return 0
+    except: return 0
+
 def get_zones(lthr):
     return {
-        'Zone 1': (0, int(lthr * 0.81)),
-        'Zone 2': (int(lthr * 0.81), int(lthr * 0.90)),
-        'Zone 3': (int(lthr * 0.90), int(lthr * 0.94)),
-        'Zone 4': (int(lthr * 0.94), int(lthr * 1.0)),
-        'Zone 5': (int(lthr * 1.0), 999),
+        'Z1': (0, int(lthr * 0.81)),
+        'Z2': (int(lthr * 0.81), int(lthr * 0.90)),
+        'Z3': (int(lthr * 0.90), int(lthr * 0.94)),
+        'Z4': (int(lthr * 0.94), int(lthr * 1.0)),
+        'Z5': (int(lthr * 1.0), 999),
     }
- 
-def classify_zone(hr, zones):
+
+def classify(hr, zones):
     for name, (lo, hi) in zones.items():
-        if lo <= hr < hi:
-            return name
-    return 'Zone 5'
- 
-def safe_int(val):
-    try:
-        return int(val.strip().strip('"').replace(',', ''))
-    except:
-        return 0
- 
-def safe_float(val):
-    try:
-        return float(val.strip().strip('"').replace(',', ''))
-    except:
-        return 0.0
- 
-# ── CSV Parsing ──────────────────────────────────────────
-def detect_activity_type(text):
-    first_line = text.split('\n')[0].lower()
-    if 'swim stroke' in first_line or 'swolf' in first_line or 'lengths' in first_line:
-        return 'swim'
-    elif 'avg speed' in first_line and 'avg pace' not in first_line:
-        return 'bike'
-    else:
-        return 'run'
- 
-def parse_run_csv(text):
-    reader = csv.reader(io.StringIO(text.replace('\r\n', '\n')))
-    header = next(reader)
-    hr_col = pace_col = dist_col = time_col = None
-    for i, h in enumerate(header):
-        h_clean = h.strip().strip('"').lower().replace('\n', ' ')
-        if 'avg hr' in h_clean: hr_col = i
-        if 'avg pace' in h_clean and pace_col is None: pace_col = i
-        if 'distance' in h_clean and dist_col is None: dist_col = i
-        if 'cumulative time' in h_clean: time_col = i
-    if hr_col is None: return None
-    laps = []
-    summary = None
-    for row in reader:
+        if lo <= hr < hi: return name
+    return 'Z5'
+
+def detect_activity(text):
+    first = text.split('\n')[0].lower()
+    if 'swim stroke' in first or 'swolf' in first or 'lengths' in first: return 'swim'
+    if 'avg speed' in first and 'avg pace' not in first: return 'bike'
+    return 'run'
+
+def progress_bar(pct, width=15):
+    filled = int(pct * width / 100)
+    return "█" * filled + "░" * (width - filled)
+
+def zone_dist(hrs, zones):
+    counts = {k: 0 for k in zones}
+    for hr in hrs:
+        counts[classify(hr, zones)] += 1
+    total = len(hrs)
+    return {k: (v, v*100//total if total else 0) for k, v in counts.items()}
+
+def cardiac_drift(laps):
+    if len(laps) > 5: analysis = laps[1:-2]
+    elif len(laps) > 3: analysis = laps[1:]
+    else: analysis = laps
+    if len(analysis) < 2: return 0, 0, 0
+    mid = len(analysis) // 2
+    first = sum(l['hr'] for l in analysis[:mid]) / mid
+    second = sum(l['hr'] for l in analysis[mid:]) / len(analysis[mid:])
+    drift = ((second - first) / first) * 100
+    return first, second, drift
+
+# ── PARSERS ──────────────────────────────────────────────
+def parse_run(text):
+    r = csv.reader(io.StringIO(text.replace('\r\n', '\n')))
+    h = next(r)
+    idx = {'hr': None, 'pace': None, 'dist': None, 'time': None, 'cad': None}
+    for i, col in enumerate(h):
+        c = col.strip().strip('"').lower().replace('\n', ' ')
+        if 'avg hr' in c: idx['hr'] = i
+        if 'avg pace' in c and idx['pace'] is None: idx['pace'] = i
+        if 'distance' in c and idx['dist'] is None: idx['dist'] = i
+        if 'cumulative time' in c: idx['time'] = i
+        if 'avg run cadence' in c: idx['cad'] = i
+    if idx['hr'] is None: return None
+    laps, summary = [], None
+    for row in r:
         if not row: continue
         label = row[0].strip().strip('"')
         if label.lower() == 'summary':
-            summary = {'avg_hr': safe_int(row[hr_col]), 'time': row[time_col].strip().strip('"') if time_col else '', 'distance': row[dist_col].strip().strip('"') if dist_col else ''}
+            summary = {
+                'avg_hr': safe_int(row[idx['hr']]),
+                'time': row[idx['time']].strip().strip('"') if idx['time'] else '',
+                'distance': safe_float(row[idx['dist']]) if idx['dist'] else 0,
+                'avg_pace': row[idx['pace']].strip().strip('"') if idx['pace'] else '',
+                'avg_cad': safe_int(row[idx['cad']]) if idx['cad'] else 0,
+            }
             continue
-        hr = safe_int(row[hr_col])
+        hr = safe_int(row[idx['hr']])
         if hr > 0:
-            lap = {'lap': label, 'avg_hr': hr}
-            if pace_col and pace_col < len(row): lap['pace'] = row[pace_col].strip().strip('"')
+            lap = {'lap': label, 'hr': hr}
+            if idx['pace'] and idx['pace'] < len(row):
+                lap['pace'] = row[idx['pace']].strip().strip('"')
+                lap['pace_min'] = pace_to_min(lap['pace'])
+            if idx['cad'] and idx['cad'] < len(row): lap['cad'] = safe_int(row[idx['cad']])
             laps.append(lap)
-    return {'type': 'run', 'laps': laps, 'summary': summary}
- 
-def parse_bike_csv(text):
-    reader = csv.reader(io.StringIO(text.replace('\r\n', '\n')))
-    header = next(reader)
-    hr_col = speed_col = dist_col = time_col = None
-    for i, h in enumerate(header):
-        h_clean = h.strip().strip('"').lower().replace('\n', ' ')
-        if 'avg hr' in h_clean: hr_col = i
-        if 'avg speed' in h_clean and speed_col is None: speed_col = i
-        if 'distance' in h_clean and dist_col is None: dist_col = i
-        if 'cumulative time' in h_clean: time_col = i
-    if hr_col is None: return None
-    laps = []
-    summary = None
-    for row in reader:
+    return {'laps': laps, 'summary': summary}
+
+def parse_bike(text):
+    r = csv.reader(io.StringIO(text.replace('\r\n', '\n')))
+    h = next(r)
+    idx = {'hr': None, 'speed': None, 'dist': None, 'time': None}
+    for i, col in enumerate(h):
+        c = col.strip().strip('"').lower().replace('\n', ' ')
+        if 'avg hr' in c: idx['hr'] = i
+        if 'avg speed' in c and idx['speed'] is None: idx['speed'] = i
+        if 'distance' in c and idx['dist'] is None: idx['dist'] = i
+        if 'cumulative time' in c: idx['time'] = i
+    if idx['hr'] is None: return None
+    laps, summary = [], None
+    for row in r:
         if not row: continue
         label = row[0].strip().strip('"')
         if label.lower() == 'summary':
-            summary = {'avg_hr': safe_int(row[hr_col]), 'time': row[time_col].strip().strip('"') if time_col else '', 'distance': row[dist_col].strip().strip('"') if dist_col else '', 'avg_speed': safe_float(row[speed_col]) if speed_col else 0}
+            summary = {
+                'avg_hr': safe_int(row[idx['hr']]),
+                'time': row[idx['time']].strip().strip('"') if idx['time'] else '',
+                'distance': safe_float(row[idx['dist']]) if idx['dist'] else 0,
+                'avg_speed': safe_float(row[idx['speed']]) if idx['speed'] else 0,
+            }
             continue
-        hr = safe_int(row[hr_col])
+        hr = safe_int(row[idx['hr']])
         if hr > 0:
-            lap = {'lap': label, 'avg_hr': hr}
-            if speed_col and speed_col < len(row): lap['speed'] = safe_float(row[speed_col])
+            lap = {'lap': label, 'hr': hr}
+            if idx['speed'] and idx['speed'] < len(row): lap['speed'] = safe_float(row[idx['speed']])
             laps.append(lap)
-    return {'type': 'bike', 'laps': laps, 'summary': summary}
- 
-def parse_swim_csv(text):
-    reader = csv.reader(io.StringIO(text.replace('\r\n', '\n')))
-    header = next(reader)
-    hr_col = pace_col = swolf_col = dist_col = stroke_col = None
-    for i, h in enumerate(header):
-        h_clean = h.strip().strip('"').lower().replace('\n', ' ')
-        if 'avg hr' in h_clean: hr_col = i
-        if 'avg pace' in h_clean: pace_col = i
-        if 'swolf' in h_clean: swolf_col = i
-        if 'distance' in h_clean: dist_col = i
-        if 'swim stroke' in h_clean: stroke_col = i
-    if hr_col is None: return None
-    sets = []
-    summary = None
-    for row in reader:
+    return {'laps': laps, 'summary': summary}
+
+def parse_swim(text):
+    r = csv.reader(io.StringIO(text.replace('\r\n', '\n')))
+    h = next(r)
+    idx = {'hr': None, 'pace': None, 'swolf': None, 'dist': None, 'stroke': None}
+    for i, col in enumerate(h):
+        c = col.strip().strip('"').lower().replace('\n', ' ')
+        if 'avg hr' in c: idx['hr'] = i
+        if 'avg pace' in c: idx['pace'] = i
+        if 'swolf' in c: idx['swolf'] = i
+        if 'distance' in c: idx['dist'] = i
+        if 'swim stroke' in c: idx['stroke'] = i
+    if idx['hr'] is None: return None
+    sets, summary = [], None
+    for row in r:
         if not row: continue
         label = row[1].strip().strip('"') if len(row) > 1 else ''
         if label.lower() == 'summary':
-            summary = {'avg_hr': safe_int(row[hr_col]) if hr_col else 0}
+            summary = {'avg_hr': safe_int(row[idx['hr']]) if idx['hr'] else 0}
             continue
-        if stroke_col and stroke_col < len(row):
-            stroke = row[stroke_col].strip().strip('"').lower()
-            if stroke == 'rest' or stroke == '--': continue
+        if idx['stroke'] and idx['stroke'] < len(row):
+            if row[idx['stroke']].strip().strip('"').lower() in ('rest', '--'): continue
         if '.' in label: continue
-        hr = safe_int(row[hr_col]) if hr_col and hr_col < len(row) else 0
+        hr = safe_int(row[idx['hr']]) if idx['hr'] and idx['hr'] < len(row) else 0
         if hr > 0 and label:
-            s = {'set': label, 'avg_hr': hr}
-            if pace_col and pace_col < len(row): s['pace'] = row[pace_col].strip().strip('"')
-            if swolf_col and swolf_col < len(row): s['swolf'] = safe_int(row[swolf_col])
-            if dist_col and dist_col < len(row): s['distance'] = row[dist_col].strip().strip('"')
+            s = {'set': label, 'hr': hr}
+            if idx['pace'] and idx['pace'] < len(row):
+                s['pace'] = row[idx['pace']].strip().strip('"')
+                s['pace_min'] = pace_to_min(s['pace'])
+            if idx['swolf'] and idx['swolf'] < len(row): s['swolf'] = safe_int(row[idx['swolf']])
             sets.append(s)
-    return {'type': 'swim', 'sets': sets, 'summary': summary}
- 
-# ── Analysis Functions ───────────────────────────────────
-def analyze_run(data, lthr):
-    laps = data['laps']
-    summary = data['summary']
+    return {'sets': sets, 'summary': summary}
+
+def classify_run_type(pct):
+    if pct < 75: return "Recovery Run", "🟢"
+    if pct < 85: return "Easy / Zone 2", "🟢"
+    if pct < 91: return "Aerobic", "🔵"
+    if pct < 96: return "Tempo", "🟡"
+    if pct < 101: return "Threshold", "🟠"
+    return "VO2max / Intervals", "🔴"
+
+def classify_ride_type(pct):
+    if pct < 75: return "Recovery", "🟢"
+    if pct < 85: return "Zone 2 Endurance", "🟢"
+    if pct < 91: return "Aerobic", "🔵"
+    if pct < 96: return "Sweet Spot / Tempo", "🟡"
+    if pct < 101: return "Threshold", "🟠"
+    return "VO2max", "🔴"
+
+# ── ANALYSIS ─────────────────────────────────────────────
+def analyze_run(data, lthr, uid):
+    laps, summary = data['laps'], data.get('summary') or {}
+    if len(laps) < 3: return "Not enough laps."
     zones = get_zones(lthr)
-    if len(laps) < 3: return "Not enough laps to analyze. Need at least 3 km."
-    zone_counts = {'Zone 1': 0, 'Zone 2': 0, 'Zone 3': 0, 'Zone 4': 0, 'Zone 5': 0}
-    for lap in laps:
-        zone_counts[classify_zone(lap['avg_hr'], zones)] += 1
-    total = len(laps)
-    analysis_laps = laps[1:-2] if len(laps) > 5 else laps[1:]
-    if len(analysis_laps) >= 4:
-        mid = len(analysis_laps) // 2
-        first_hr = sum(l['avg_hr'] for l in analysis_laps[:mid]) / mid
-        second_hr = sum(l['avg_hr'] for l in analysis_laps[mid:]) / len(analysis_laps[mid:])
+    avg_hr = summary.get('avg_hr') or sum(l['hr'] for l in laps) // len(laps)
+    pct = avg_hr / lthr * 100
+    run_type, emoji = classify_run_type(pct)
+    dist = summary.get('distance', 0)
+    time = summary.get('time', 'N/A')
+    cad = summary.get('avg_cad', 0)
+    
+    zd = zone_dist([l['hr'] for l in laps], zones)
+    first, second, drift = cardiac_drift(laps)
+    
+    msg = f"""{emoji} *RUN ANALYSIS*
+━━━━━━━━━━━━━━━━━━━━
+📍 {dist:.2f} km · ⏱ {time} · 💓 {avg_hr} bpm
+
+*Type:* {run_type}
+_{pct:.0f}% of LTHR ({lthr})_
+
+*Zones:*"""
+    labels = {'Z1': 'Recovery', 'Z2': 'Aerobic', 'Z3': 'Tempo', 'Z4': 'Threshold', 'Z5': 'VO2max'}
+    for z, (c, p) in zd.items():
+        if c > 0 or z in ('Z1','Z2','Z3'):
+            msg += f"\n{z} {labels[z]:10} {progress_bar(p)} {p:>3}%"
+    
+    msg += f"\n\n*Cardiac Drift:*\n{first:.0f} → {second:.0f} bpm ({drift:+.1f}%)"
+    if drift < 3: msg += "\n✅ Excellent aerobic fitness"
+    elif drift < 5: msg += "\n✅ Solid aerobic base"
+    elif drift < 8: msg += "\n⚠️ Moderate — need more Zone 2"
+    else: msg += "\n🔴 High — aerobic engine needs work"
+    
+    if cad:
+        if cad >= 175: msg += f"\n\n👟 Cadence: {cad} spm ✅"
+        elif cad >= 170: msg += f"\n\n👟 Cadence: {cad} spm (aim for 175+)"
+        else: msg += f"\n\n👟 Cadence: {cad} spm ⚠️ (low — longer strides waste energy)"
+    
+    msg += "\n\n*💡 Coach's Read:*"
+    z2_ceil = zones['Z2'][1]
+    if pct < 85:
+        over = sum(1 for l in laps if l['hr'] > z2_ceil)
+        if over >= 3:
+            msg += f"\nYou went above Zone 2 ({z2_ceil} bpm) on {over} laps. This is the #1 amateur mistake — easy runs that aren't easy. Slow down 20-30 sec/km. Aerobic gains come from easy effort, not moderate effort."
+        elif drift > 8:
+            msg += f"\nHigh drift on an easy run = weak aerobic base. The fix is MORE easy running, not less. Your heart is working hard because your cardiovascular system is underdeveloped."
+        else:
+            msg += f"\nTextbook Zone 2. This is where base fitness is built. Boring but effective."
+    elif pct < 91:
+        msg += f"\nAerobic sweet spot. Good stimulus. Just ensure 80% of your weekly volume stays below Zone 2 ceiling ({z2_ceil})."
+    elif pct < 96:
+        msg += f"\nTempo session. 'Comfortably uncomfortable.' Keep to 1-2x per week. Next 2 days should be easy or rest."
+    elif pct < 101:
+        msg += f"\nThreshold work — race pace territory. Directly builds your lactate threshold, the #1 predictor of endurance performance."
     else:
-        first_hr, second_hr = laps[0]['avg_hr'], laps[-1]['avg_hr']
-    drift = ((second_hr - first_hr) / first_hr) * 100
-    avg_hr = summary['avg_hr'] if summary else sum(l['avg_hr'] for l in laps) // len(laps)
-    pct_lthr = (avg_hr / lthr) * 100
-    if pct_lthr < 81: run_type = "Easy / Recovery Run"
-    elif pct_lthr < 90: run_type = "Aerobic / Zone 2 Run"
-    elif pct_lthr < 94: run_type = "Tempo Run"
-    elif pct_lthr < 100: run_type = "Threshold Run"
-    else: run_type = "VO2max / Interval Session"
-    dist = summary['distance'] if summary else str(len(laps))
-    time = summary['time'] if summary else "N/A"
-    msg = f"🏃 *RUN ANALYSIS*\n{dist} km · {time} · Avg HR {avg_hr}\n\n*Type:* {run_type}\nAvg HR = {pct_lthr:.0f}% of LTHR ({lthr})\n\n*Zone Distribution:*"
-    for z, count in zone_counts.items():
-        pct = count * 100 // total if total > 0 else 0
-        bar = "█" * (pct // 5)
-        msg += f"\n{z}: {count}/{total} ({pct}%) {bar}"
-    msg += f"\n\n*Cardiac Drift:*\nFirst half: {first_hr:.0f} bpm\nSecond half: {second_hr:.0f} bpm\nDrift: {drift:.1f}%"
-    if drift < 3: msg += "\n✅ Excellent aerobic base"
-    elif drift < 5: msg += "\n✅ Good — solid aerobic system"
-    elif drift < 8: msg += "\n⚠️ Moderate — more Zone 2 volume needed"
-    else: msg += "\n🔴 High — aerobic base needs work"
-    z2_ceil = zones['Zone 2'][1]
-    if pct_lthr < 90:
-        over = sum(1 for l in laps if l['avg_hr'] > z2_ceil)
-        if over > 0: msg += f"\n\n*Coach:* ⚠️ {over} laps exceeded Zone 2 ceiling ({z2_ceil} bpm). Slow down on easy days."
-        else: msg += f"\n\n*Coach:* Well-executed aerobic run. You stayed under Zone 2 ceiling ({z2_ceil}). This builds your engine."
-    elif pct_lthr < 94: msg += "\n\n*Coach:* Solid tempo. Keep to once per week max."
-    elif pct_lthr < 100: msg += "\n\n*Coach:* Hard session. Next 2 days should be easy/rest."
-    else: msg += "\n\n*Coach:* High intensity. Make sure you recover properly."
+        msg += f"\nHigh intensity. Major stimulus. Body needs 48-72h to adapt — don't stack another hard day."
+    
+    user_workouts[uid].append({
+        'date': datetime.now(), 'sport': 'run',
+        'avg_hr': avg_hr, 'distance': dist,
+        'type': run_type, 'drift': drift, 'pct_lthr': pct,
+    })
     return msg
- 
-def analyze_bike_data(data, lthr):
-    laps = data['laps']
-    summary = data['summary']
+
+def analyze_bike(data, lthr, uid):
+    laps, summary = data['laps'], data.get('summary') or {}
+    if len(laps) < 2: return "Not enough laps."
     zones = get_zones(lthr)
-    if len(laps) < 2: return "Not enough laps to analyze."
-    zone_counts = {'Zone 1': 0, 'Zone 2': 0, 'Zone 3': 0, 'Zone 4': 0, 'Zone 5': 0}
-    for lap in laps:
-        zone_counts[classify_zone(lap['avg_hr'], zones)] += 1
-    total = len(laps)
-    mid = len(laps) // 2
-    first_hr = sum(l['avg_hr'] for l in laps[:mid]) / mid
-    second_hr = sum(l['avg_hr'] for l in laps[mid:]) / len(laps[mid:])
-    drift = ((second_hr - first_hr) / first_hr) * 100
-    avg_hr = summary['avg_hr'] if summary else sum(l['avg_hr'] for l in laps) // len(laps)
-    avg_speed = summary.get('avg_speed', 0) if summary else 0
-    dist = summary['distance'] if summary else 'N/A'
-    time = summary['time'] if summary else 'N/A'
-    msg = f"🚴 *BIKE ANALYSIS*\n{dist} km · {time} · Avg HR {avg_hr}"
+    avg_hr = summary.get('avg_hr') or sum(l['hr'] for l in laps) // len(laps)
+    avg_speed = summary.get('avg_speed', 0)
+    dist = summary.get('distance', 0)
+    time = summary.get('time', 'N/A')
+    pct = avg_hr / lthr * 100
+    ride_type, emoji = classify_ride_type(pct)
+    
+    zd = zone_dist([l['hr'] for l in laps], zones)
+    first, second, drift = cardiac_drift(laps)
+    
+    msg = f"""{emoji} *BIKE ANALYSIS*
+━━━━━━━━━━━━━━━━━━━━
+📍 {dist:.1f} km · ⏱ {time} · 💓 {avg_hr} bpm"""
     if avg_speed: msg += f" · {avg_speed:.1f} km/h"
-    msg += "\n\n*Zone Distribution:*"
-    for z, count in zone_counts.items():
-        pct = count * 100 // total if total > 0 else 0
-        bar = "█" * (pct // 5)
-        msg += f"\n{z}: {count}/{total} ({pct}%) {bar}"
-    msg += f"\n\n*Cardiac Drift:*\nFirst half: {first_hr:.0f} bpm\nSecond half: {second_hr:.0f} bpm\nDrift: {drift:+.1f}%"
-    if drift < 0: msg += "\n✅ HR decreased — good settling"
-    elif drift < 5: msg += "\n✅ Acceptable drift"
-    else: msg += "\n⚠️ Significant drift — pacing too hard early"
-    z3_floor = zones['Zone 3'][0]
-    z2_ceil = zones['Zone 2'][1]
-    high = sum(1 for l in laps if l['avg_hr'] >= z3_floor)
-    if high > 0: msg += f"\n\n⚠️ *Intensity Flag:* {high} laps hit Zone 3+ (HR ≥{z3_floor}). Zone 2 ceiling = {z2_ceil}"
+    msg += f"\n\n*Type:* {ride_type}\n_{pct:.0f}% of LTHR ({lthr})_\n\n*Zones:*"
+    
+    labels = {'Z1': 'Recovery', 'Z2': 'Endurance', 'Z3': 'Sweet Spot', 'Z4': 'Threshold', 'Z5': 'VO2max'}
+    for z, (c, p) in zd.items():
+        if c > 0 or z in ('Z1','Z2','Z3'):
+            msg += f"\n{z} {labels[z]:12} {progress_bar(p)} {p:>3}%"
+    
+    msg += f"\n\n*Cardiac Drift:*\n{first:.0f} → {second:.0f} bpm ({drift:+.1f}%)"
+    if drift < 0: msg += "\n✅ HR decreased — excellent efficiency"
+    elif drift < 3: msg += "\n✅ Minimal drift — solid pacing"
+    elif drift < 6: msg += "\n⚠️ Moderate drift"
+    else: msg += "\n🔴 Significant drift — pacing needs work"
+    
     if avg_speed > 0:
         t = 180 / avg_speed
-        msg += f"\n\n*Ironman Projection:* At {avg_speed:.1f} km/h: ~{int(t)}h {int((t%1)*60)}min for 180km"
-    msg += f"\n\n*Coach:* Ironman bike = Zone 2 only (HR {zones['Zone 2'][0]}-{z2_ceil}). Riding harder costs you the run."
+        h, m = int(t), int((t % 1) * 60)
+        msg += f"\n\n🏁 *Ironman 180km Projection:*\nAt {avg_speed:.1f} km/h: ~{h}h {m:02d}min"
+    
+    msg += "\n\n*💡 Coach's Read:*"
+    z2_ceil = zones['Z2'][1]
+    z3_floor = zones['Z3'][0]
+    over = sum(1 for l in laps if l['hr'] >= z3_floor)
+    if pct < 85:
+        msg += f"\nTextbook Zone 2 riding. This IS the foundation for long-course success. Ironman bike should look exactly like this — consistent effort, nothing heroic."
+    elif pct < 91 and over >= len(laps) // 3:
+        msg += f"\nYou crept above Zone 2 on {over} laps. For Ironman training this is too hard — leaves you unable to run off the bike. Slow down early, finish strong."
+    elif pct < 96:
+        msg += f"\nSweet spot work. Great for 70.3/Olympic training. Too hard for Ironman race pace."
+    else:
+        msg += f"\nHard ride. Builds threshold power but costs recovery. Tomorrow must be easy or off."
+    
+    user_workouts[uid].append({
+        'date': datetime.now(), 'sport': 'bike',
+        'avg_hr': avg_hr, 'distance': dist, 'avg_speed': avg_speed,
+        'type': ride_type, 'drift': drift, 'pct_lthr': pct,
+    })
     return msg
- 
-def analyze_swim_data(data):
-    sets = [s for s in data['sets'] if s['avg_hr'] > 50]
-    if len(sets) < 2: return "Not enough swim sets with HR data."
-    msg = "🏊 *SWIM ANALYSIS*\n\n*Set Breakdown:*\n"
-    for s in sets:
-        line = f"Set {s['set']}: HR {s['avg_hr']}"
-        if 'pace' in s and s['pace'] and s['pace'] != '--': line += f" · {s['pace']}/100m"
-        if 'swolf' in s and s['swolf']: line += f" · SWOLF {s['swolf']}"
-        msg += line + "\n"
-    drift = ((sets[-1]['avg_hr'] - sets[0]['avg_hr']) / sets[0]['avg_hr']) * 100
-    msg += f"\n*Cardiac Drift:* {sets[0]['avg_hr']} → {sets[-1]['avg_hr']} ({drift:.1f}%)"
-    if drift > 15: msg += "\n🔴 High — aerobic swim base needs volume"
-    elif drift > 8: msg += "\n⚠️ Moderate — build longer continuous swims"
-    else: msg += "\n✅ Controlled drift"
-    swolf_sets = [s for s in sets if 'swolf' in s and s['swolf'] > 0]
+
+def analyze_swim(data, uid):
+    sets = [s for s in data['sets'] if s['hr'] > 50]
+    if len(sets) < 2: return "Not enough sets with HR."
+    
+    msg = "🏊 *SWIM ANALYSIS*\n━━━━━━━━━━━━━━━━━━━━\n\n*Sets:*"
+    for s in sets[:10]:
+        line = f"\nSet {s['set']}: {s['hr']} bpm"
+        if 'pace' in s and s.get('pace') and s['pace'] != '--': line += f" · {s['pace']}/100m"
+        if s.get('swolf', 0) > 0: line += f" · SWOLF {s['swolf']}"
+        msg += line
+    
+    drift = ((sets[-1]['hr'] - sets[0]['hr']) / sets[0]['hr']) * 100
+    msg += f"\n\n*Cardiac Drift:*\n{sets[0]['hr']} → {sets[-1]['hr']} bpm ({drift:+.1f}%)"
+    if drift > 15: msg += "\n🔴 High — aerobic swim base is limiter"
+    elif drift > 8: msg += "\n⚠️ Moderate — more continuous volume"
+    else: msg += "\n✅ Controlled"
+    
+    swolf_sets = [s for s in sets if s.get('swolf', 0) > 0]
     if len(swolf_sets) >= 2:
         sc = swolf_sets[-1]['swolf'] - swolf_sets[0]['swolf']
-        msg += f"\n\n*Efficiency:* SWOLF {swolf_sets[0]['swolf']} → {swolf_sets[-1]['swolf']} ({sc:+d})"
-        if sc > 3: msg += "\n⚠️ Technique breaking down — add drill work"
-    msg += "\n\n*Coach:* Build longer continuous swims (800-1500m) at easy pace. The goal is holding pace without HR climbing."
+        msg += f"\n\n*Technique:* SWOLF {swolf_sets[0]['swolf']} → {swolf_sets[-1]['swolf']} ({sc:+d})"
+        if sc > 4: msg += "\n⚠️ Technique breaking down — add drill work"
+        elif sc > 0: msg += "\nSlight degradation — normal"
+        else: msg += "\n✅ Maintained"
+    
+    pace_sets = [s for s in sets if s.get('pace_min', 0) > 0]
+    if len(pace_sets) >= 3:
+        decay = ((pace_sets[-1]['pace_min'] - pace_sets[0]['pace_min']) / pace_sets[0]['pace_min']) * 100
+        msg += f"\n\n*Pace Stability:*\n{pace_sets[0]['pace']} → {pace_sets[-1]['pace']}"
+        if decay < 3: msg += f"\n✅ Held pace ({decay:+.1f}%)"
+        elif decay < 8: msg += f"\n⚠️ Pace dropped {decay:.0f}%"
+        else: msg += f"\n🔴 Pace dropped {decay:.0f}% — aerobic base weak"
+    
+    msg += "\n\n*💡 Coach's Read:*"
+    if drift > 15:
+        msg += "\nThe HR jump is the biggest signal. Your aerobic swim base is underdeveloped — normal for triathletes coming from run/bike. Fix: 2-3x/week continuous 800-1500m swims at easy pace. Goal isn't to get tired — it's to teach your aerobic system to swim."
+    elif drift > 8:
+        msg += "\nAdd more continuous work. Short intervals = anaerobic. Long continuous = aerobic base (what Ironman needs)."
+    else:
+        msg += "\nStrong aerobic swim fitness. You can push pace and volume now."
+    
+    user_workouts[uid].append({
+        'date': datetime.now(), 'sport': 'swim',
+        'avg_hr': sum(s['hr'] for s in sets) // len(sets),
+        'drift': drift,
+    })
     return msg
- 
-# ── Bot Handlers ─────────────────────────────────────────
+
+# ── TRENDS ───────────────────────────────────────────────
+def trends(uid):
+    w = user_workouts.get(uid, [])
+    if len(w) < 3:
+        return f"📊 *TREND ANALYSIS*\n\nYou have {len(w)} workout(s) logged. I need at least 3 to show patterns.\n\nSend more Garmin CSVs and I'll show you:\n• HR drift trends over time\n• Sport distribution\n• Whether you're following 80/20\n• Fitness direction (improving/plateauing/declining)"
+    
+    recent = sorted(w, key=lambda x: x['date'])[-20:]
+    
+    sport_ct = defaultdict(int)
+    for x in recent: sport_ct[x['sport']] += 1
+    
+    msg = f"📊 *TREND ANALYSIS*\n━━━━━━━━━━━━━━━━━━━━\nLast {len(recent)} workouts\n\n*Sport Distribution:*"
+    total = sum(sport_ct.values())
+    for sp, c in sport_ct.items():
+        emoji = {'run':'🏃','bike':'🚴','swim':'🏊'}.get(sp, '⚡')
+        msg += f"\n{emoji} {sp.title()}: {c} ({c*100//total}%)"
+    
+    runs = [x for x in recent if x['sport'] == 'run']
+    if len(runs) >= 2:
+        avg_drift = sum(r['drift'] for r in runs) / len(runs)
+        msg += f"\n\n*Avg Run Cardiac Drift:* {avg_drift:.1f}%"
+        if avg_drift < 5: msg += " ✅"
+        elif avg_drift < 8: msg += " ⚠️"
+        else: msg += " 🔴"
+    
+    # 80/20 check
+    land = [x for x in recent if x['sport'] in ('run','bike') and 'pct_lthr' in x]
+    if len(land) >= 3:
+        easy = sum(1 for x in land if x['pct_lthr'] < 85)
+        hard = sum(1 for x in land if x['pct_lthr'] >= 91)
+        ep = easy * 100 // len(land)
+        msg += f"\n\n*Training Intensity:*\n🟢 Easy/Z2: {ep}%\n🟠 Tempo+: {hard * 100 // len(land)}%"
+        if ep >= 75: msg += "\n✅ Following 80/20 principle"
+        elif ep >= 60: msg += "\n⚠️ Too much moderate ('gray zone')"
+        else: msg += "\n🔴 Too much high intensity"
+    
+    return msg
+
+# ── BOT ──────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = """👋 *Welcome to EnduraIQ*
- 
-I'm your AI endurance coach. Send me your Garmin CSV files and I'll give you real coaching — not just charts.
- 
-*Get started in 2 steps:*
- 
-1️⃣ Set your zones — send me:
+
+Professional AI coaching for endurance athletes.
+
+I analyze your Garmin workouts using the same sports science elite coaches use — translated into plain language you can act on.
+
+*Quick setup:*
+
+1️⃣ Set your zones:
 `run: 180 bike: 165`
-(replace with your LTHR numbers)
-Or use /defaults for estimated values
- 
-2️⃣ Export a workout from Garmin Connect as CSV and send it here
- 
+
+2️⃣ Export from Garmin Connect and send me the CSV file
+
+I respond instantly with:
+• Workout type classification
+• Cardiac drift (are you truly getting fitter?)
+• Zone distribution (right intensity?)
+• Personalized coaching notes
+• Race projections
+
 *Commands:*
-/setup — How to set your LTHR
-/defaults — Use estimated zones
-/help — How to export from Garmin
-/about — What I analyze
- 
-_Built by an athlete, for athletes._"""
+/setup — Set LTHR
+/defaults — Use estimates
+/help — Export from Garmin
+/trends — Training patterns
+/about — The science I use
+
+_No fluff. No "nice run!" Just signal, not noise._"""
     await update.message.reply_text(msg, parse_mode="Markdown")
- 
+
 async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = """⚙️ *Setup Your Zones*
- 
-Send me your LTHR like this:
+
+Send me your LTHR:
 `run: 180 bike: 165`
- 
-*Don't know your LTHR?*
-Do a 30-min all-out solo effort (run or bike). Your avg HR for the last 20 min is roughly your LTHR.
- 
-Or use /defaults to start with estimates."""
+
+*30-min field test to find LTHR:*
+1. Warm up 15 min
+2. 30-min solo time trial at hardest sustainable effort
+3. Your avg HR for the LAST 20 min ≈ your LTHR
+4. Test run and bike separately (they differ ~10 bpm)
+
+*Why LTHR zones matter:*
+Max HR or age-based zones are often 10-15 bpm off. LTHR zones are personal to YOUR physiology — what Friel and elite coaches use.
+
+Or use /defaults to start immediately with estimates."""
     await update.message.reply_text(msg, parse_mode="Markdown")
- 
-async def defaults(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def defaults_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user_data[uid] = {'run_lthr': 175, 'bike_lthr': 170}
+    user_profiles[uid] = {'run_lthr': 170, 'bike_lthr': 165}
     msg = """✅ *Defaults Set*
-Run LTHR: 175 · Bike LTHR: 170
- 
-Now send me a Garmin CSV file!"""
+Run LTHR: 170 · Bike LTHR: 165
+
+These are estimates. For real zones, do a 30-min test and update:
+`run: YOUR_NUMBER bike: YOUR_NUMBER`
+
+Send me a Garmin CSV to analyze!"""
     await update.message.reply_text(msg, parse_mode="Markdown")
- 
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = """📖 *How to Export from Garmin*
- 
-1. Go to *connect.garmin.com* on a computer
+
+*On your computer:*
+1. connect.garmin.com
 2. Click *Activities*
-3. Click any activity
-4. Click the ⚙️ gear icon (top right)
+3. Click any workout
+4. Click ⚙️ gear icon (top right)
 5. Click *Export to CSV*
-6. Send that file here
- 
-I'll analyze zone distribution, cardiac drift, pacing, and give you coaching notes."""
+6. Send the file here
+
+*What I analyze:*
+• Run: pace, HR, cadence, zones, drift
+• Bike: speed, HR, zones, drift
+• Swim: pace, HR, SWOLF, drift"""
     await update.message.reply_text(msg, parse_mode="Markdown")
- 
+
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = """🧠 *What EnduraIQ Analyzes*
- 
-• *Cardiac Drift* — HR creep at same pace = aerobic fitness indicator
-• *Zone Distribution* — Are you really doing 80/20?
-• *Intensity Classification* — Easy vs tempo vs threshold vs VO2
-• *Pacing Flags* — Started too hard? Faded? I catch it
-• *Swim Efficiency* — SWOLF trends under fatigue
-• *Ironman Projections* — Estimated race splits
- 
-Based on Friel's methodology and sports science research.
- 
-Free during beta. $15/mo after."""
+    msg = """🧠 *What EnduraIQ Does*
+━━━━━━━━━━━━━━━━━━━━
+
+*The problem:*
+Strava, Garmin, TrainingPeaks show you charts. They don't tell you what to DO.
+
+*What I do:*
+I analyze your workout and give you an actual coaching read. In plain language.
+
+*The science:*
+
+🔹 *Cardiac Drift* — HR creep at same pace. The best marker of aerobic fitness.
+
+🔹 *LTHR Zones* (Friel) — Zones from YOUR lactate threshold, not age formulas. 10-15 bpm more accurate.
+
+🔹 *Zone Distribution* — Are you really 80/20? Most amateurs are 50/50 ('gray zone').
+
+🔹 *Intensity Classification* — Was it easy, aerobic, tempo, threshold, or VO2? Calculated from YOUR LTHR.
+
+*I'm not:*
+A workout generator. A plan app. A social feed.
+
+I'm the coach's eye on your data.
+
+*Pricing:* Free during beta. $15/mo at launch.
+
+_Built by an endurance athlete training for IRONMAN Jacksonville._"""
     await update.message.reply_text(msg, parse_mode="Markdown")
- 
+
+async def trends_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.message.reply_text(trends(uid), parse_mode="Markdown")
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip().lower()
     if 'run:' in text or 'bike:' in text:
-        run_lthr = 175
-        bike_lthr = 170
+        if uid not in user_profiles: user_profiles[uid] = {}
         rm = re.search(r'run:\s*(\d+)', text)
         bm = re.search(r'bike:\s*(\d+)', text)
-        if rm: run_lthr = int(rm.group(1))
-        if bm: bike_lthr = int(bm.group(1))
-        user_data[uid] = {'run_lthr': run_lthr, 'bike_lthr': bike_lthr}
+        if rm: user_profiles[uid]['run_lthr'] = int(rm.group(1))
+        if bm: user_profiles[uid]['bike_lthr'] = int(bm.group(1))
+        run_lthr = user_profiles[uid].get('run_lthr', 170)
+        bike_lthr = user_profiles[uid].get('bike_lthr', 165)
         rz = get_zones(run_lthr)
         bz = get_zones(bike_lthr)
         msg = f"""✅ *Profile Set*
- 
+
 *Run (LTHR {run_lthr}):*
-Z1: <{rz['Zone 1'][1]} · Z2: {rz['Zone 2'][0]}-{rz['Zone 2'][1]} · Z3: {rz['Zone 3'][0]}-{rz['Zone 3'][1]} · Z4: {rz['Zone 4'][0]}-{rz['Zone 4'][1]} · Z5: >{rz['Zone 5'][0]}
- 
+Z1 Recovery: <{rz['Z1'][1]}
+Z2 Aerobic: {rz['Z2'][0]}-{rz['Z2'][1]}
+Z3 Tempo: {rz['Z3'][0]}-{rz['Z3'][1]}
+Z4 Threshold: {rz['Z4'][0]}-{rz['Z4'][1]}
+Z5 VO2max: >{rz['Z5'][0]}
+
 *Bike (LTHR {bike_lthr}):*
-Z1: <{bz['Zone 1'][1]} · Z2: {bz['Zone 2'][0]}-{bz['Zone 2'][1]} · Z3: {bz['Zone 3'][0]}-{bz['Zone 3'][1]} · Z4: {bz['Zone 4'][0]}-{bz['Zone 4'][1]} · Z5: >{bz['Zone 5'][0]}
- 
+Z1 Recovery: <{bz['Z1'][1]}
+Z2 Endurance: {bz['Z2'][0]}-{bz['Z2'][1]}
+Z3 Sweet Spot: {bz['Z3'][0]}-{bz['Z3'][1]}
+Z4 Threshold: {bz['Z4'][0]}-{bz['Z4'][1]}
+Z5 VO2max: >{bz['Z5'][0]}
+
 Now send me a Garmin CSV!"""
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
-    await update.message.reply_text("Send me a Garmin CSV file and I'll analyze it.\n\nUse /help for export instructions.\nUse /setup to set your zones.", parse_mode="Markdown")
- 
+    await update.message.reply_text("Send me a Garmin CSV file.\n\n/help · /setup · /about · /trends", parse_mode="Markdown")
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    profile = user_data.get(uid, {'run_lthr': 175, 'bike_lthr': 170})
+    profile = user_profiles.get(uid, {'run_lthr': 170, 'bike_lthr': 165})
     doc = update.message.document
     if not doc.file_name.endswith('.csv'):
-        await update.message.reply_text("Please send a .csv file from Garmin Connect. Use /help for instructions.")
+        await update.message.reply_text("Please send a .csv from Garmin Connect. /help for instructions.")
         return
-    await update.message.reply_text("🔄 Analyzing your workout...")
+    await update.message.reply_text("🔄 Analyzing...")
     try:
-        file = await doc.get_file()
-        file_bytes = await file.download_as_bytearray()
-        text = file_bytes.decode('utf-8', errors='ignore')
-        activity_type = detect_activity_type(text)
-        if activity_type == 'swim':
-            data = parse_swim_csv(text)
-            msg = analyze_swim_data(data) if data and len(data['sets']) >= 2 else "Couldn't parse swim data."
-        elif activity_type == 'bike':
-            data = parse_bike_csv(text)
-            msg = analyze_bike_data(data, profile['bike_lthr']) if data and len(data['laps']) >= 2 else "Couldn't parse bike data."
+        f = await doc.get_file()
+        b = await f.download_as_bytearray()
+        text = b.decode('utf-8', errors='ignore')
+        atype = detect_activity(text)
+        if atype == 'swim':
+            d = parse_swim(text)
+            msg = analyze_swim(d, uid) if d and len(d['sets']) >= 2 else "Couldn't parse swim data."
+        elif atype == 'bike':
+            d = parse_bike(text)
+            msg = analyze_bike(d, profile.get('bike_lthr', 165), uid) if d and len(d['laps']) >= 2 else "Couldn't parse bike data."
         else:
-            data = parse_run_csv(text)
-            msg = analyze_run(data, profile['run_lthr']) if data and len(data['laps']) >= 2 else "Couldn't parse run data."
+            d = parse_run(text)
+            msg = analyze_run(d, profile.get('run_lthr', 170), uid) if d and len(d['laps']) >= 2 else "Couldn't parse run data."
         await update.message.reply_text(msg, parse_mode="Markdown")
+        if len(user_workouts[uid]) == 3:
+            await update.message.reply_text("📊 3 workouts logged — try /trends to see your patterns.", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"Error: {str(e)}\n\nMake sure it's a CSV from Garmin Connect.")
- 
+        await update.message.reply_text(f"Error: {str(e)[:100]}")
+
 async def set_commands(app):
     await app.bot.set_my_commands([
         BotCommand("start", "Welcome & setup"),
         BotCommand("setup", "Set your LTHR zones"),
-        BotCommand("defaults", "Use default zones"),
-        BotCommand("help", "How to export from Garmin"),
-        BotCommand("about", "What EnduraIQ analyzes"),
+        BotCommand("defaults", "Use estimated zones"),
+        BotCommand("help", "Export from Garmin"),
+        BotCommand("trends", "Training patterns"),
+        BotCommand("about", "The science I use"),
     ])
- 
+
 def main():
     app = Application.builder().token(TOKEN).post_init(set_commands).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup", setup))
-    app.add_handler(CommandHandler("defaults", defaults))
+    app.add_handler(CommandHandler("defaults", defaults_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("about", about))
+    app.add_handler(CommandHandler("trends", trends_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("EnduraIQ Coach bot v2 is running...")
+    print("EnduraIQ v3 running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
- 
+
 if __name__ == "__main__":
     main()
